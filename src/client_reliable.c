@@ -18,56 +18,56 @@
 static int wait_for_ack(int sock, uint32_t expected_seq,
                         const struct sockaddr_in *server)
 {
-    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sock, &readfds);
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
 
-        struct timeval timeout;
-        timeout.tv_sec = ACK_TIMEOUT_MS / 1000;
-        timeout.tv_usec = (ACK_TIMEOUT_MS % 1000) * 1000;
+    struct timeval timeout;
+    timeout.tv_sec = ACK_TIMEOUT_MS / 1000;
+    timeout.tv_usec = (ACK_TIMEOUT_MS % 1000) * 1000;
 
-        int ready = select(sock + 1, &readfds, NULL, NULL, &timeout);
+    int ready = select(sock + 1, &readfds, NULL, NULL, &timeout);
 
-        if (ready < 0) {
-            if (errno == EINTR) {
-                attempt--;
-                continue;
-            }
-            perror("select");
-            return -1;
-        }
+    if (ready < 0) {
+        if (errno == EINTR)
+            return 1;
 
-        if (ready == 0) {
-            fprintf(stderr, "ACK timeout (attempt %d/%d)\n",
-                    attempt + 1, MAX_RETRIES);
-            continue;
-        }
-
-        Packet ack;
-        struct sockaddr_in from;
-        socklen_t from_len = sizeof(from);
-        memset(&ack, 0, sizeof(ack));
-
-        ssize_t n = recvfrom(sock, &ack, sizeof(ack), 0,
-                             (struct sockaddr *)&from, &from_len);
-
-        if (n < (ssize_t)PACKET_HEADER_SIZE)
-            continue;
-
-        if (from.sin_addr.s_addr != server->sin_addr.s_addr ||
-            from.sin_port != server->sin_port)
-            continue;
-
-        if (ack.magic == PACKET_MAGIC &&
-            ack.type == PACKET_ACK &&
-            ack.seq == expected_seq)
-            return 0;
+        perror("select");
+        return -1;
     }
 
-    fprintf(stderr, "Failed to receive ACK for sequence %" PRIu32 "\n",
-            expected_seq);
-    return -1;
+    if (ready == 0)
+        return 1;
+
+    Packet ack;
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    memset(&ack, 0, sizeof(ack));
+
+    ssize_t n = recvfrom(sock, &ack, sizeof(ack), 0,
+                         (struct sockaddr *)&from, &from_len);
+
+    if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            return 1;
+
+        perror("recvfrom");
+        return -1;
+    }
+
+    if (n < (ssize_t)PACKET_HEADER_SIZE)
+        return 1;
+
+    if (from.sin_addr.s_addr != server->sin_addr.s_addr ||
+        from.sin_port != server->sin_port)
+        return 1;
+
+    if (ack.magic == PACKET_MAGIC &&
+        ack.type == PACKET_ACK &&
+        ack.seq == expected_seq)
+        return 0;
+
+    return 1;
 }
 
 static int send_packet_with_retry(int sock, const Packet *packet,

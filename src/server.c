@@ -9,7 +9,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
+#include <sys/time.h>
 #include "protocol.h"
 
 #define OUTPUT_FILE "received_file.bin"
@@ -19,7 +19,7 @@ int main(void)
     int server_socket;
     struct sockaddr_in server_addr;
     struct sockaddr_in client_addr;
-    struct sockaddr_in transfer_client;
+    struct sockaddr_in transfer_client={0};
     socklen_t client_len;
 
     server_socket = socket(AF_INET, SOCK_DGRAM, 0);
@@ -229,11 +229,105 @@ int main(void)
         }
 
         if (received_size == expected_size) {
-            success = 1;
-            printf("File received successfully: %s\n", OUTPUT_FILE);
+    if (fflush(file) != 0) {
+        perror("fflush");
+        success = 0;
+        break;
+    }
+
+    if (fclose(file) != 0) {
+        perror("fclose");
+        file = NULL;
+        success = 0;
+        break;
+    }
+
+    file = NULL;
+    success = 1;
+
+    printf("File received successfully: %s\n", OUTPUT_FILE);
+
+    /*
+     * Keep the server available briefly so it can re-ACK
+     * a retransmitted final data packet.
+     */
+    struct timeval timeout;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt");
+        break;
+    }
+
+    for (;;) {
+        Packet final_packet;
+        struct sockaddr_in final_client;
+        socklen_t final_client_len = sizeof(final_client);
+
+        ssize_t final_n = recvfrom(
+            server_socket,
+            &final_packet,
+            sizeof(final_packet),
+            0,
+            (struct sockaddr *)&final_client,
+            &final_client_len
+        );
+
+        if (final_n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+
+            if (errno == EINTR)
+                continue;
+
+            perror("recvfrom");
+            success = 0;
             break;
         }
+
+        if (final_client.sin_addr.s_addr !=
+                transfer_client.sin_addr.s_addr ||
+            final_client.sin_port != transfer_client.sin_port)
+            continue;
+
+        if (final_n < (ssize_t)PACKET_HEADER_SIZE ||
+            final_packet.magic != PACKET_MAGIC ||
+            final_packet.type != PACKET_DATA ||
+            final_packet.seq != last_ack ||
+            final_packet.data_len == 0 ||
+            final_packet.data_len > DATA_SIZE ||
+            final_n != (ssize_t)(PACKET_HEADER_SIZE +
+                                 final_packet.data_len))
+            continue;
+
+        if (payload_checksum(final_packet.data,
+                             final_packet.data_len) !=
+            final_packet.checksum)
+            continue;
+
+        memset(&ack, 0, sizeof(ack));
+        ack.magic = PACKET_MAGIC;
+        ack.type = PACKET_ACK;
+        ack.seq = last_ack;
+
+        if (sendto(server_socket, &ack, PACKET_HEADER_SIZE, 0,
+                   (struct sockaddr *)&final_client,
+                   final_client_len) != (ssize_t)PACKET_HEADER_SIZE) {
+            perror("sendto final ACK");
+            success = 0;
+            break;
+        }
+
+        printf("Re-acknowledged final packet %" PRIu32 "\n",
+               last_ack);
     }
+
+    break;
+}
+}
+   
 
     if (file != NULL) {
         if (fclose(file) != 0) {
